@@ -1822,6 +1822,32 @@ impl Payroll {
             .unwrap_or(false)
     }
 
+    /// Check whether an asset has been explicitly deactivated by the admin.
+    ///
+    /// A deactivated asset is the canonical treasury asset with an explicit
+    /// `false` allowlist entry. It cannot back payouts, deposits, or treasury
+    /// movements until the admin re-enables it through
+    /// [`Self::set_asset_allowed`]. Unlike [`Self::is_asset_allowed`], this
+    /// distinguishes "explicitly switched off" from "never configured", and
+    /// returns `false` for any asset that is not this contract's canonical
+    /// treasury asset.
+    pub fn is_asset_deactivated(e: Env, asset: Address) -> bool {
+        let canonical_asset: Option<Address> = e
+            .storage()
+            .persistent()
+            .get(&DataKey::Addresses)
+            .map(|addresses: ContractAddresses| addresses.token);
+        if canonical_asset.as_ref() != Some(&asset) {
+            return false;
+        }
+        matches!(
+            e.storage()
+                .persistent()
+                .get::<_, bool>(&DataKey::AllowedAsset(asset)),
+            Some(false)
+        )
+    }
+
     /// Validate the canonical treasury asset used by all payroll transfers.
     ///
     /// Asset identity is the serialized Soroban token contract address. A
@@ -1840,6 +1866,21 @@ impl Payroll {
             return Err(TreasuryError::AssetNotAllowed);
         }
         Ok(())
+    }
+
+    /// Panic with an actionable message when an asset cannot back a treasury
+    /// movement.
+    ///
+    /// Keeps the two failure modes distinguishable: a deactivated asset is a
+    /// configuration state the admin can undo, while a foreign asset is an
+    /// identity mismatch that can never be corrected at runtime.
+    fn require_active_treasury_asset(e: &Env, asset: Address) {
+        match Self::validate_treasury_asset(e.clone(), asset) {
+            Ok(()) => {}
+            Err(TreasuryError::AssetNotAllowed) => panic!("Asset not allowed"),
+            Err(TreasuryError::CrossAssetMismatch) => panic!("Cross-asset treasury mismatch"),
+            Err(_) => panic!("Invalid asset configuration"),
+        }
     }
 
     /// Return the payroll assets currently enabled for this employer contract.
@@ -1865,17 +1906,25 @@ impl Payroll {
             panic!("Deposit amount must be positive");
         }
 
-        let nonce_key = DataKey::DepositNonce(deposit_id.clone());
-        if e.storage().persistent().has(&nonce_key) {
-            panic!("Deposit already processed");
-        }
-        e.storage().persistent().set(&nonce_key, &true);
-
         let addrs: ContractAddresses = e
             .storage()
             .persistent()
             .get(&DataKey::Addresses)
             .expect("Not initialized");
+
+        // Deactivated assets must not accept new deposits: payouts are already
+        // blocked for a deactivated asset, so inbound funds would be stranded.
+        // Checked before the deposit nonce is recorded so a rejected deposit
+        // does not burn the caller's deposit id.
+        if !Self::is_asset_allowed(e.clone(), addrs.token.clone()) {
+            panic!("Asset not allowed");
+        }
+
+        let nonce_key = DataKey::DepositNonce(deposit_id.clone());
+        if e.storage().persistent().has(&nonce_key) {
+            panic!("Deposit already processed");
+        }
+        e.storage().persistent().set(&nonce_key, &true);
 
         let treasury_owner: Address = e
             .storage()
@@ -4317,8 +4366,7 @@ impl Payroll {
     }
 
     pub fn add_locked_funds(e: &Env, asset: Address, amount: i128) {
-        Self::validate_treasury_asset(e.clone(), asset.clone())
-            .expect("Cross-asset treasury mismatch");
+        Self::require_active_treasury_asset(e, asset.clone());
         let key = DataKey::LockedPayrollFunds(asset.clone());
         let current: i128 = e.storage().persistent().get(&key).unwrap_or(0i128);
         let new_locked = current.checked_add(amount).expect("Locked funds overflow");
@@ -4327,8 +4375,7 @@ impl Payroll {
     }
 
     pub fn subtract_locked_funds(e: &Env, asset: Address, amount: i128) {
-        Self::validate_treasury_asset(e.clone(), asset.clone())
-            .expect("Cross-asset treasury mismatch");
+        Self::require_active_treasury_asset(e, asset.clone());
         let key = DataKey::LockedPayrollFunds(asset.clone());
         let current: i128 = e.storage().persistent().get(&key).unwrap_or(0i128);
         let new_locked = current.checked_sub(amount).expect("Locked funds underflow");
@@ -5980,8 +6027,7 @@ impl Payroll {
     /// balance allocated to pending payroll runs, blocked balances, and the net
     /// available balance without disclosing individual salary rows.
     pub fn get_safe_treasury_summary(e: Env, asset: Address) -> SafeTreasurySummary {
-        Self::validate_treasury_asset(e.clone(), asset.clone())
-            .expect("Cross-asset treasury mismatch");
+        Self::require_active_treasury_asset(&e, asset.clone());
         let addrs: ContractAddresses = e
             .storage()
             .persistent()
@@ -9088,6 +9134,66 @@ mod tests {
             },
         }]);
         payroll_client.set_asset_allowed(&token_id, &false);
+    }
+
+    #[test]
+    fn test_asset_deactivation_status_tracks_allowlist_changes() {
+        let env = Env::default();
+        let (payroll_client, _admin, _treasury, _treasury_owner, _employee, token_id) =
+            setup_payroll_with_token(&env);
+
+        // Freshly initialized canonical asset is active, and therefore not deactivated.
+        assert!(payroll_client.is_asset_allowed(&token_id));
+        assert!(!payroll_client.is_asset_deactivated(&token_id));
+
+        // Deactivation is explicit and observable through a dedicated view.
+        payroll_client.set_asset_allowed(&token_id, &false);
+        assert!(!payroll_client.is_asset_allowed(&token_id));
+        assert!(payroll_client.is_asset_deactivated(&token_id));
+
+        // Reactivating the asset clears the deactivated state.
+        payroll_client.set_asset_allowed(&token_id, &true);
+        assert!(payroll_client.is_asset_allowed(&token_id));
+        assert!(!payroll_client.is_asset_deactivated(&token_id));
+
+        // A foreign asset is never reported as deactivated: it is simply not
+        // this contract's canonical treasury asset.
+        let foreign_asset = Address::generate(&env);
+        assert!(!payroll_client.is_asset_deactivated(&foreign_asset));
+        assert!(!payroll_client.is_asset_allowed(&foreign_asset));
+    }
+
+    #[test]
+    #[should_panic(expected = "Asset not allowed")]
+    fn test_deposit_fails_when_asset_deactivated() {
+        let env = Env::default();
+        let (payroll_client, _admin, treasury, _treasury_owner, _employee, token_id) =
+            setup_payroll_with_token(&env);
+
+        payroll_client.set_asset_allowed(&token_id, &false);
+
+        payroll_client.deposit(&treasury, &1000, &test_nonce(&env, 250));
+    }
+
+    #[test]
+    fn test_deposit_resumes_after_asset_reactivated() {
+        let env = Env::default();
+        let (payroll_client, _admin, treasury, _treasury_owner, _employee, token_id) =
+            setup_payroll_with_token(&env);
+
+        payroll_client.set_asset_allowed(&token_id, &false);
+        let deposit_id = test_nonce(&env, 251);
+        let blocked = payroll_client.try_deposit(&treasury, &1000, &deposit_id);
+        assert!(blocked.is_err());
+
+        // A rejected deposit leaves no depositor accounting behind.
+        assert_eq!(payroll_client.get_treasury_balance(&treasury), 0);
+
+        // It also does not burn the deposit id, so the same retry succeeds once
+        // the admin reactivates the asset.
+        payroll_client.set_asset_allowed(&token_id, &true);
+        payroll_client.deposit(&treasury, &1000, &deposit_id);
+        assert_eq!(payroll_client.get_treasury_balance(&treasury), 1000);
     }
 
     // ?? Reviewer Authorization & Run Review Tests ????????????????????????????
