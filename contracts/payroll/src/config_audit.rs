@@ -76,6 +76,8 @@ pub mod config_keys {
     pub const TREASURY_OWNER: &str = "treasury_owner";
     /// `set_organization_policy` — value: `OrganizationPolicy`.
     pub const ORGANIZATION_POLICY: &str = "organization_policy";
+    /// `set_correction_limits` — value: `CorrectionAuthorizationLimits` (issue #577).
+    pub const CORRECTION_AUTHORIZATION_LIMITS: &str = "correction_authorization_limits";
 }
 
 /// `sha256(value.to_xdr())`: the reference published for a configuration

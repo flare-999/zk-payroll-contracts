@@ -1,134 +1,163 @@
-//! Employer-configured authorization limits for payroll corrections (#577).
+//! Employer-configured authorization limits for payroll corrections (issue #577).
 //!
-//! A *correction* is an amendment to a pending payroll draft, applied through
-//! [`crate::Payroll::amend_run_draft`]. Corrections move money, so an employer
-//! may want a ceiling on how much correction activity a single payroll period
-//! can absorb before the policy is deliberately revisited.
+//! A *correction* is an amendment to a pending payroll run draft, applied
+//! through `amend_run_draft`. Before this module the amendment flow accepted
+//! any number of amendments of any size, so an employer had no on-chain way to
+//! bound how much a correction could move or how many employees it could touch.
 //!
-//! Limits are opt-in. While no policy is configured
-//! ([`crate::Payroll::get_correction_auth_limits`] returns `None`),
-//! `amend_run_draft` behaves exactly as it did before this module existed: no
-//! counter is read, no storage is written, and no correction is rejected. Once
-//! an admin calls [`crate::Payroll::set_correction_auth_limits`], every
-//! amendment in that period is checked against the configured ceilings and
-//! recorded against the period's usage counters.
+//! An employer opts in by calling `set_correction_limits`. Until
+//! they do, no limits are stored and the amendment flow behaves exactly as it
+//! always has — this is deliberately backward compatible. Once limits are
+//! configured, every correction to a payroll period is measured against three
+//! counters accumulated for that period:
 //!
-//! Three independent ceilings are supported, each disabled by `0`:
+//! * the number of corrections applied,
+//! * the cumulative absolute amount moved by those corrections,
+//! * the number of employees covered by those corrections.
 //!
-//! * [`CorrectionAuthorizationLimits::max_corrections_per_period`] — how many
-//!   amendments a period accepts.
-//! * [`CorrectionAuthorizationLimits::max_total_delta`] — cumulative absolute
-//!   change in draft total amount.
-//! * [`CorrectionAuthorizationLimits::max_employees_corrected`] — cumulative
-//!   employee count carried by corrected drafts.
-//!
-//! Everything here is privacy-safe: counters are aggregate numbers only. No
-//! salary amount, employee identity, or proof material is stored or surfaced,
-//! and a rejection names the ceiling that was hit rather than any value.
+//! Everything here is privacy-safe: it stores and reports only aggregate
+//! counters and totals. It never reads, emits, or returns salary amounts,
+//! per-employee values, or employee identities, and the rejection messages
+//! name the limit that was hit without disclosing any payroll value.
 
-use soroban_sdk::contracttype;
+use soroban_sdk::{contracttype, Env, Symbol};
 
-/// Employer-configured correction authorization ceilings for a payroll period.
+use crate::DataKey;
+
+/// Employer-configured authorization limits for payroll corrections.
 ///
-/// A ceiling of `0` disables that particular check, so an all-zero policy is
-/// equivalent to leaving the limits unset. Limits are enforced per payroll
-/// period.
+/// Corrections are opt-in limited: when this policy is absent from storage the
+/// amendment flow performs no correction checks at all. A zero on an individual
+/// field means "that dimension is not capped", so an all-zero policy is
+/// equivalent to leaving the feature disabled.
+///
+/// Privacy-safe: contains only counts and thresholds, never salary values or
+/// employee identities.
 #[contracttype]
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CorrectionAuthorizationLimits {
-    /// Maximum number of corrections accepted per payroll period (`0` = no cap).
+    /// Maximum number of corrections allowed per payroll period.
     pub max_corrections_per_period: u32,
-    /// Maximum cumulative absolute change in draft total amount per period
-    /// (`0` = no cap).
+    /// Maximum cumulative absolute value delta allowed per payroll period.
     pub max_total_delta: i128,
-    /// Maximum cumulative employee count carried by corrected drafts per period
-    /// (`0` = no cap).
+    /// Maximum number of employees whose entries may be corrected per period.
     pub max_employees_corrected: u32,
 }
 
-/// Accumulated correction usage counters for a single payroll period.
-///
-/// Absent storage means "no corrections recorded yet"; [`CorrectionUsage::ZERO`]
-/// is returned in that case. The struct intentionally carries no salary or
-/// employee identifiers.
+/// Accumulated correction usage counters for a single payroll period, tracked
+/// against the employer's configured [`CorrectionAuthorizationLimits`].
 #[contracttype]
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CorrectionUsage {
-    /// Corrections applied to drafts in this period.
+    /// Corrections successfully applied so far in this period.
     pub correction_count: u32,
-    /// Cumulative absolute change in draft total amount across those corrections.
+    /// Cumulative absolute amount moved by those corrections.
     pub total_delta: i128,
-    /// Cumulative employee count carried by those corrected drafts.
+    /// Employees covered by those corrections.
     pub employees_corrected: u32,
 }
 
-/// Which configured ceiling rejected a correction.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CorrectionLimitBreach {
-    /// `max_corrections_per_period` would be exceeded.
-    CorrectionsPerPeriod,
-    /// `max_total_delta` would be exceeded.
-    TotalDelta,
-    /// `max_employees_corrected` would be exceeded.
-    EmployeesCorrected,
-}
-
 impl CorrectionUsage {
-    /// Counters for a period with no recorded corrections.
-    pub const ZERO: CorrectionUsage = CorrectionUsage {
-        correction_count: 0,
-        total_delta: 0,
-        employees_corrected: 0,
-    };
-
-    /// Counters after applying one correction whose total amount moved by
-    /// `delta` and which carries `employees_touched` employees. Uses
-    /// saturating arithmetic so a pathological input can never wrap a counter.
-    pub fn plus(&self, delta: i128, employees_touched: u32) -> CorrectionUsage {
-        CorrectionUsage {
-            correction_count: self.correction_count.saturating_add(1),
-            total_delta: self.total_delta.saturating_add(delta),
-            employees_corrected: self.employees_corrected.saturating_add(employees_touched),
+    /// The counters reported for a period that has seen no corrections.
+    pub(crate) fn zeroed() -> Self {
+        Self {
+            correction_count: 0,
+            total_delta: 0,
+            employees_corrected: 0,
         }
     }
 }
 
-impl CorrectionAuthorizationLimits {
-    /// An all-zero policy constrains nothing and is treated as "not configured".
-    pub fn is_effective(&self) -> bool {
-        self.max_corrections_per_period > 0
-            || self.max_total_delta > 0
-            || self.max_employees_corrected > 0
+/// The configured correction policy, or `None` when the feature is disabled.
+pub(crate) fn configured_limits(e: &Env) -> Option<CorrectionAuthorizationLimits> {
+    e.storage()
+        .persistent()
+        .get(&DataKey::CorrectionAuthorizationLimits)
+}
+
+/// Accumulated correction usage for `period_label`.
+///
+/// Returns zeroed counters when nothing has been recorded for the period, so
+/// callers never have to special-case a missing record.
+pub(crate) fn usage_for(e: &Env, period_label: &Symbol) -> CorrectionUsage {
+    e.storage()
+        .persistent()
+        .get(&DataKey::CorrectionUsage(period_label.clone()))
+        .unwrap_or_else(CorrectionUsage::zeroed)
+}
+
+/// Store a new correction policy.
+pub(crate) fn write_limits(e: &Env, limits: &CorrectionAuthorizationLimits) {
+    e.storage()
+        .persistent()
+        .set(&DataKey::CorrectionAuthorizationLimits, limits);
+}
+
+/// Reject a correction that would exceed any configured limit.
+///
+/// Call this *before* applying a correction so a rejected attempt leaves no
+/// partial state behind. When no policy is configured the check is a no-op,
+/// which is what keeps the feature backward compatible.
+///
+/// # Panics
+/// * `delta` is negative.
+/// * The period has already used its allowance of corrections, employees, or
+///   total delta.
+pub(crate) fn require_within_limits(
+    e: &Env,
+    period_label: &Symbol,
+    delta: i128,
+    employees_touched: u32,
+) {
+    if delta < 0 {
+        panic!("Correction delta cannot be negative");
     }
 
-    /// Whether applying one correction of `delta` magnitude carrying
-    /// `employees_touched` employees would stay within every configured ceiling,
-    /// evaluated against the period's existing `usage`.
-    ///
-    /// `delta` is an absolute magnitude, so raising and lowering a draft total
-    /// both consume the same budget. A zero ceiling disables that check.
-    pub fn check(
-        &self,
-        usage: &CorrectionUsage,
-        delta: i128,
-        employees_touched: u32,
-    ) -> Result<(), CorrectionLimitBreach> {
-        if self.max_corrections_per_period > 0
-            && usage.correction_count >= self.max_corrections_per_period
-        {
-            return Err(CorrectionLimitBreach::CorrectionsPerPeriod);
-        }
-        if self.max_employees_corrected > 0
-            && usage.employees_corrected.saturating_add(employees_touched)
-                > self.max_employees_corrected
-        {
-            return Err(CorrectionLimitBreach::EmployeesCorrected);
-        }
-        if self.max_total_delta > 0
-            && usage.total_delta.saturating_add(delta) > self.max_total_delta
-        {
-            return Err(CorrectionLimitBreach::TotalDelta);
-        }
-        Ok(())
+    let Some(limits) = configured_limits(e) else {
+        return;
+    };
+    let usage = usage_for(e, period_label);
+
+    if limits.max_corrections_per_period > 0
+        && usage.correction_count >= limits.max_corrections_per_period
+    {
+        panic!("Correction authorization limit exceeded: maximum corrections per period reached");
     }
+    if limits.max_employees_corrected > 0
+        && usage.employees_corrected.saturating_add(employees_touched)
+            > limits.max_employees_corrected
+    {
+        panic!(
+            "Correction authorization limit exceeded: maximum employees corrected per period reached"
+        );
+    }
+    if limits.max_total_delta > 0
+        && usage.total_delta.saturating_add(delta) > limits.max_total_delta
+    {
+        panic!("Correction authorization limit exceeded: maximum total delta per period reached");
+    }
+}
+
+/// Record a correction that has been applied.
+///
+/// Call this only after the correction has been written, so the counters never
+/// advance for an attempt that reverted. When no policy is configured this is a
+/// no-op and writes no storage, so contracts that never opt in pay nothing for
+/// the feature.
+pub(crate) fn record(e: &Env, period_label: &Symbol, delta: i128, employees_touched: u32) {
+    if !e
+        .storage()
+        .persistent()
+        .has(&DataKey::CorrectionAuthorizationLimits)
+    {
+        return;
+    }
+
+    let mut usage = usage_for(e, period_label);
+    usage.correction_count = usage.correction_count.saturating_add(1);
+    usage.total_delta = usage.total_delta.saturating_add(delta);
+    usage.employees_corrected = usage.employees_corrected.saturating_add(employees_touched);
+    e.storage()
+        .persistent()
+        .set(&DataKey::CorrectionUsage(period_label.clone()), &usage);
 }
