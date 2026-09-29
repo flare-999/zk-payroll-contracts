@@ -24,6 +24,11 @@ use signed_operator_actions::{
 pub mod execution_authorization;
 use execution_authorization::ExecutionInitiatorAuthorization;
 
+pub mod correction_authorization;
+use correction_authorization::{
+    CorrectionAuthorizationLimits, CorrectionLimitBreach, CorrectionUsage,
+};
+
 pub mod import_source;
 use import_source::{require_authorized_source, validate_source_for_report};
 
@@ -1221,6 +1226,13 @@ pub enum DataKey {
     OrganizationPolicyMigration,
     /// Registered import source for payroll batch authorization.
     ImportSource(Address),
+    /// Employer-configured correction authorization ceilings (#577). Absent
+    /// means corrections are unrestricted, matching the pre-existing behaviour
+    /// of `amend_run_draft`.
+    CorrectionAuthorizationLimits,
+    /// Accumulated correction usage counters for a payroll period (#577).
+    /// Absent means no corrections have been recorded for the period.
+    CorrectionUsage(Symbol),
     // Future upgrade example (issue #196):
     // PayrollRunV2(u64),  // Would be added here when schema evolution is needed
 }
@@ -5114,6 +5126,12 @@ impl Payroll {
         if new_total_amount <= 0 {
             panic!("total_amount must be positive");
         }
+        // Issue #577: correction authorization limits, when configured, cap how
+        // much correction activity a payroll period accepts. `delta` is the
+        // absolute magnitude of the change, so raising and lowering the draft
+        // total consume the same budget. Enforced before any state is written.
+        let delta = (new_total_amount - draft.total_amount).abs();
+        Self::require_correction_authorized(&e, &draft.period_label, delta, new_employee_count);
         draft.total_amount = new_total_amount;
         draft.employee_count = new_employee_count;
         draft.amendment_count += 1;
@@ -5130,7 +5148,171 @@ impl Payroll {
             new_employee_count,
             draft.amendment_count,
         );
+        // Issue #577: count the applied correction against the period.
+        Self::record_correction_usage(&e, &draft.period_label, delta, new_employee_count);
     }
+
+    // ── Issue #577: payroll correction authorization limits ──────────────────
+
+    /// Configure the employer's correction authorization ceilings.
+    ///
+    /// Only the registered payroll admin may set limits, the contract must not
+    /// be paused, and no payroll run may be in progress (#253). Passing all-zero
+    /// ceilings stores an ineffective policy, which is equivalent to clearing
+    /// it: `amend_run_draft` stops enforcing and stops counting.
+    ///
+    /// A negative `max_total_delta` is rejected because it could never be
+    /// satisfied.
+    pub fn set_correction_auth_limits(
+        e: Env,
+        admin: Address,
+        max_corrections_per_period: u32,
+        max_total_delta: i128,
+        max_employees_corrected: u32,
+    ) {
+        Self::require_not_paused(&e);
+        let addrs: ContractAddresses = e
+            .storage()
+            .persistent()
+            .get(&DataKey::Addresses)
+            .expect("Not initialized");
+        if admin != addrs.admin {
+            panic!("Unauthorized");
+        }
+        admin.require_auth();
+        Self::require_no_active_payroll_run(&e);
+
+        if max_total_delta < 0 {
+            panic!("Correction amount limit cannot be negative");
+        }
+
+        let limits = CorrectionAuthorizationLimits {
+            max_corrections_per_period,
+            max_total_delta,
+            max_employees_corrected,
+        };
+        e.storage()
+            .persistent()
+            .set(&DataKey::CorrectionAuthorizationLimits, &limits);
+
+        // Correction limits are configuration, so the change is announced. The
+        // payload carries the ceilings themselves — configuration values, never
+        // payroll data — so operators can reconstruct the active policy.
+        e.events().publish(
+            (
+                symbol_short!("payroll"),
+                Symbol::new(&e, "corr_limits_set"),
+            ),
+            (
+                admin.clone(),
+                max_corrections_per_period,
+                max_total_delta,
+                max_employees_corrected,
+            ),
+        );
+    }
+
+    /// Read the employer's configured correction authorization ceilings.
+    ///
+    /// Returns `None` when no policy has been configured, meaning corrections
+    /// behave exactly as they did before this feature existed.
+    pub fn get_correction_auth_limits(e: Env) -> Option<CorrectionAuthorizationLimits> {
+        e.storage()
+            .persistent()
+            .get(&DataKey::CorrectionAuthorizationLimits)
+    }
+
+    /// Read the accumulated correction usage for a payroll period.
+    ///
+    /// Returns zeroed counters when the period has no recorded corrections.
+    /// Privacy-safe: aggregate counts and magnitudes only.
+    pub fn get_correction_usage(e: Env, period_label: Symbol) -> CorrectionUsage {
+        e.storage()
+            .persistent()
+            .get(&DataKey::CorrectionUsage(period_label))
+            .unwrap_or(CorrectionUsage::ZERO)
+    }
+
+    /// Enforce the configured correction ceilings for one amendment.
+    ///
+    /// No-op when no effective policy is configured, so existing workflows are
+    /// untouched. Otherwise a rejected amendment panics before any state is
+    /// written, leaving the period's counters intact.
+    fn require_correction_authorized(
+        e: &Env,
+        period_label: &Symbol,
+        delta: i128,
+        employees_touched: u32,
+    ) {
+        let Some(limits) = e
+            .storage()
+            .persistent()
+            .get::<DataKey, CorrectionAuthorizationLimits>(&DataKey::CorrectionAuthorizationLimits)
+        else {
+            return;
+        };
+        if !limits.is_effective() {
+            return;
+        }
+        let usage: CorrectionUsage = e
+            .storage()
+            .persistent()
+            .get(&DataKey::CorrectionUsage(period_label.clone()))
+            .unwrap_or(CorrectionUsage::ZERO);
+        if let Err(breach) = limits.check(&usage, delta, employees_touched) {
+            Self::panic_correction_limit(breach);
+        }
+    }
+
+    /// Record an applied correction against the period's usage counters.
+    ///
+    /// No-op unless an effective policy is configured, so deployments that do
+    /// not use the feature never pay for the counter write.
+    fn record_correction_usage(
+        e: &Env,
+        period_label: &Symbol,
+        delta: i128,
+        employees_touched: u32,
+    ) {
+        let Some(limits) = e
+            .storage()
+            .persistent()
+            .get::<DataKey, CorrectionAuthorizationLimits>(&DataKey::CorrectionAuthorizationLimits)
+        else {
+            return;
+        };
+        if !limits.is_effective() {
+            return;
+        }
+        let key = DataKey::CorrectionUsage(period_label.clone());
+        let usage: CorrectionUsage = e
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or(CorrectionUsage::ZERO);
+        e.storage()
+            .persistent()
+            .set(&key, &usage.plus(delta, employees_touched));
+    }
+
+    /// Reject a correction with the operator message for the ceiling it hit.
+    ///
+    /// Kept as a match over string literals so the panic carries a static
+    /// message and never formats a payroll value into the host error.
+    fn panic_correction_limit(breach: CorrectionLimitBreach) -> ! {
+        match breach {
+            CorrectionLimitBreach::CorrectionsPerPeriod => panic!(
+                "Correction authorization limit exceeded: period correction count reached; raise or clear the correction limits"
+            ),
+            CorrectionLimitBreach::TotalDelta => panic!(
+                "Correction authorization limit exceeded: period correction amount budget reached; raise or clear the correction limits"
+            ),
+            CorrectionLimitBreach::EmployeesCorrected => panic!(
+                "Correction authorization limit exceeded: period corrected-employee budget reached; raise or clear the correction limits"
+            ),
+        }
+    }
+
 
     /// Update the reconciliation status of a completed payroll run.
     ///
